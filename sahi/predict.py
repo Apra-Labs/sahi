@@ -38,7 +38,7 @@ from sahi.utils.cv import (
     crop_object_predictions,
     cv2,
     get_video_reader,
-    read_image_as_pil,
+    read_image_as_pil,  # Ensure this is imported
     visualize_object_predictions,
 )
 from sahi.utils.file import Path, increment_path, list_files, save_json, save_pickle
@@ -164,9 +164,11 @@ def get_sliced_prediction(
     slice_dir: Optional[str] = None,
     exclude_classes_by_name: Optional[List[str]] = None,
     exclude_classes_by_id: Optional[List[int]] = None,
+    custom_rois: Optional[List[List[int]]] = None,
 ) -> PredictionResult:
     """
-    Function for slice image + get predicion for each slice + combine predictions in full image.
+    Function for slice image + get prediction for each slice + combine predictions in full image,
+    or get prediction for custom regions of interest (ROIs).
 
     Args:
         image: str or np.ndarray
@@ -219,38 +221,23 @@ def get_sliced_prediction(
         exclude_classes_by_id: Optional[List[int]]
             None: if no classes are excluded
             List[int]: set of classes to exclude using one or more IDs
+        custom_rois: Optional[List[List[int]]]
+            List of custom region of interest rectangles `[[x_min, y_min, x_max, y_max], ...]`.
+            If provided, slicing logic will be bypassed, and predictions will be made only
+            within these regions. Shifts are applied to match the original image coordinates.
+            Defaults to ``None``.
     Returns:
         A Dict with fields:
             object_prediction_list: a list of sahi.prediction.ObjectPrediction
             durations_in_seconds: a dict containing elapsed times for profiling
     """
 
+    # Ensure numpy is imported
+    import numpy as np
+
     # for profiling
-    durations_in_seconds = dict()
-
-    # currently only 1 batch supported
-    num_batch = 1
-    # create slices from full image
-    time_start = time.time()
-    slice_image_result = slice_image(
-        image=image,
-        output_file_name=slice_export_prefix,
-        output_dir=slice_dir,
-        slice_height=slice_height,
-        slice_width=slice_width,
-        overlap_height_ratio=overlap_height_ratio,
-        overlap_width_ratio=overlap_width_ratio,
-        auto_slice_resolution=auto_slice_resolution,
-    )
-    from sahi.models.ultralytics import UltralyticsDetectionModel
-
-    num_slices = len(slice_image_result)
-    time_end = time.time() - time_start
-    durations_in_seconds["slice"] = time_end
-
-    if isinstance(detection_model, UltralyticsDetectionModel) and detection_model.is_obb:
-        # Only NMS is supported for OBB model outputs
-        postprocess_type = "NMS"
+    durations_in_seconds = dict(prediction=0, postprocess=0)
+    object_prediction_list = []
 
     # init match postprocess instance
     if postprocess_type not in POSTPROCESS_NAME_TO_CLASS.keys():
@@ -264,14 +251,93 @@ def get_sliced_prediction(
         class_agnostic=postprocess_class_agnostic,
     )
 
-    # create prediction input
-    num_group = int(num_slices / num_batch)
-    if verbose == 1 or verbose == 2:
-        tqdm.write(f"Performing prediction on {num_slices} slices.")
-    object_prediction_list = []
-    # perform sliced prediction
-    for group_ind in range(num_group):
-        # prepare batch (currently supports only 1 batch)
+    # Handle custom ROIs if provided
+    if custom_rois:
+        if verbose:
+            tqdm.write(f"Performing prediction on {len(custom_rois)} custom ROIs.")
+
+        image_as_pil = read_image_as_pil(image)
+        original_height, original_width = image_as_pil.height, image_as_pil.width
+        full_shape = [original_height, original_width]
+
+        for roi in custom_rois:
+            x_min, y_min, x_max, y_max = roi
+            # Ensure ROI coordinates are within image bounds
+            x_min = max(0, x_min)
+            y_min = max(0, y_min)
+            x_max = min(original_width, x_max)
+            y_max = min(original_height, y_max)
+
+            # Crop image
+            cropped_pil_image = image_as_pil.crop((x_min, y_min, x_max, y_max))
+            cropped_np_image = np.ascontiguousarray(cropped_pil_image)
+
+            # Get prediction for the crop
+            prediction_result = get_prediction(
+                image=cropped_np_image,
+                detection_model=detection_model,
+                shift_amount=[x_min, y_min],
+                full_shape=full_shape,
+                postprocess=None, # Postprocessing is done once at the end
+                verbose=0, # Reduce verbosity for individual ROI predictions
+                exclude_classes_by_name=exclude_classes_by_name,
+                exclude_classes_by_id=exclude_classes_by_id,
+            )
+
+            # Accumulate predictions and durations
+            object_prediction_list.extend(prediction_result.object_prediction_list)
+            if "prediction" in prediction_result.durations_in_seconds:
+                 durations_in_seconds["prediction"] += prediction_result.durations_in_seconds["prediction"]
+            # Note: postprocess duration is handled after the loop
+
+    # Default slicing logic if custom_rois is not provided
+    else:
+        # currently only 1 batch supported
+    num_batch = 1
+        # for profiling specific to slicing
+        durations_in_seconds["slice"] = 0
+
+        # create slices from full image
+        time_start = time.time()
+        slice_image_result = slice_image(
+            image=image,
+        output_file_name=slice_export_prefix,
+        output_dir=slice_dir,
+        slice_height=slice_height,
+        slice_width=slice_width,
+        overlap_height_ratio=overlap_height_ratio,
+        overlap_width_ratio=overlap_width_ratio,
+            auto_slice_resolution=auto_slice_resolution,
+        )
+        from sahi.models.ultralytics import UltralyticsDetectionModel
+
+        num_slices = len(slice_image_result)
+        time_end = time.time() - time_start
+        durations_in_seconds["slice"] = time_end
+
+        if isinstance(detection_model, UltralyticsDetectionModel) and detection_model.is_obb:
+            # Only NMS is supported for OBB model outputs
+            if postprocess_type != "NMS":
+                 logger.warning("OBB model detected. Setting postprocess_type to 'NMS'.")
+                 postprocess_type = "NMS"
+                 # Re-initialize postprocess for OBB NMS
+                 postprocess = NMSPostprocess(
+                     match_threshold=postprocess_match_threshold,
+                     match_metric='IOU',  # NMS typically uses IOU
+                     class_agnostic=postprocess_class_agnostic,
+                 )
+
+
+        # create prediction input
+        num_batch = 1 # currently only 1 batch supported
+        num_group = int(num_slices / num_batch)
+        if verbose == 1 or verbose == 2:
+            tqdm.write(f"Performing prediction on {num_slices} slices.")
+
+        # perform sliced prediction
+        pred_start_time = time.time()
+        for group_ind in range(num_group):
+            # prepare batch (currently supports only 1 batch)
         image_list = []
         shift_amount_list = []
         for image_ind in range(num_batch):
@@ -286,22 +352,29 @@ def get_sliced_prediction(
                 slice_image_result.original_image_height,
                 slice_image_result.original_image_width,
             ],
-            exclude_classes_by_name=exclude_classes_by_name,
-            exclude_classes_by_id=exclude_classes_by_id,
-        )
-        # convert sliced predictions to full predictions
-        for object_prediction in prediction_result.object_prediction_list:
-            if object_prediction:  # if not empty
-                object_prediction_list.append(object_prediction.get_shifted_object_prediction())
+                exclude_classes_by_name=exclude_classes_by_name,
+                exclude_classes_by_id=exclude_classes_by_id,
+            )
+            # Accumulate durations
+            if "prediction" in prediction_result.durations_in_seconds:
+                durations_in_seconds["prediction"] += prediction_result.durations_in_seconds["prediction"]
 
-        # merge matching predictions during sliced prediction
-        if merge_buffer_length is not None and len(object_prediction_list) > merge_buffer_length:
-            object_prediction_list = postprocess(object_prediction_list)
+            # convert sliced predictions to full predictions
+            for object_prediction in prediction_result.object_prediction_list:
+                if object_prediction:  # if not empty
+                    object_prediction_list.append(object_prediction.get_shifted_object_prediction())
 
-    # perform standard prediction
-    if num_slices > 1 and perform_standard_pred:
-        prediction_result = get_prediction(
-            image=image,
+            # merge matching predictions during sliced prediction
+            if merge_buffer_length is not None and len(object_prediction_list) > merge_buffer_length:
+                # Apply interim postprocessing if buffer is used
+                 object_prediction_list = postprocess(object_prediction_list)
+
+
+        # perform standard prediction if requested
+        if num_slices > 1 and perform_standard_pred:
+            std_pred_start_time = time.time()
+            prediction_result = get_prediction(
+                image=image,
             detection_model=detection_model,
             shift_amount=[0, 0],
             full_shape=[
@@ -309,29 +382,45 @@ def get_sliced_prediction(
                 slice_image_result.original_image_width,
             ],
             postprocess=None,
-            exclude_classes_by_name=exclude_classes_by_name,
-            exclude_classes_by_id=exclude_classes_by_id,
-        )
-        object_prediction_list.extend(prediction_result.object_prediction_list)
+                exclude_classes_by_name=exclude_classes_by_name,
+                exclude_classes_by_id=exclude_classes_by_id,
+            )
+            object_prediction_list.extend(prediction_result.object_prediction_list)
+            std_pred_end_time = time.time() - std_pred_start_time
+            durations_in_seconds["prediction"] += std_pred_end_time
+            # Note: Postprocessing for standard pred happens in the final step
 
-    # merge matching predictions
+        pred_end_time = time.time() - pred_start_time
+        # If standard prediction was not performed, the total prediction time is just the slice prediction time
+        if not (num_slices > 1 and perform_standard_pred):
+             durations_in_seconds["prediction"] = pred_end_time
+
+
+    # Apply final postprocessing to the aggregated list
     if len(object_prediction_list) > 1:
+        postprocess_start_time = time.time()
         object_prediction_list = postprocess(object_prediction_list)
-
-    time_end = time.time() - time_start
-    durations_in_seconds["prediction"] = time_end
+        postprocess_end_time = time.time() - postprocess_start_time
+        durations_in_seconds["postprocess"] = postprocess_end_time
 
     if verbose == 2:
-        print(
-            "Slicing performed in",
-            durations_in_seconds["slice"],
-            "seconds.",
-        )
+        if "slice" in durations_in_seconds and durations_in_seconds["slice"] > 0:
+             print(
+                 "Slicing performed in",
+                 durations_in_seconds["slice"],
+                 "seconds.",
+             )
         print(
             "Prediction performed in",
             durations_in_seconds["prediction"],
             "seconds.",
         )
+        if durations_in_seconds.get("postprocess", 0) > 0:
+             print(
+                 "Postprocessing performed in",
+                 durations_in_seconds["postprocess"],
+                 "seconds."
+             )
 
     return PredictionResult(
         image=image, object_prediction_list=object_prediction_list, durations_in_seconds=durations_in_seconds
