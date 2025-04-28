@@ -35,7 +35,6 @@ class Yolov9TorchDetectionModel(DetectionModel):
         """Load a PyTorch model (.pt file)."""
         try:
             model = torch.load(self.model_path, map_location=self.device, weights_only=False)
-            model.eval()
             self.set_model(model)
         except Exception as e:
             raise TypeError(f"model_path is not a valid PyTorch model path: {e}")
@@ -108,15 +107,17 @@ class Yolov9TorchDetectionModel(DetectionModel):
             raise ValueError("Model is not loaded, load it by calling .load_model()")
 
         # Assume model expects a square input (e.g., (640,640))
-        input_shape = (self.model.yaml.get("imgsz", 640), self.model.yaml.get("imgsz", 640))  # You might need to adjust how to get size
+        input_shape = (self.model['opt']['imgsz'], self.model['opt']['imgsz'])  # You might need to adjust how to get size
         image_shape = image.shape[:2]
 
         # Preprocess
         image_tensor = self._preprocess_image(image, input_shape)
+        image_tensor = image_tensor.half()
 
         # Inference
         with torch.no_grad():
-            outputs = self.model(image_tensor)
+            outputs = self.model['model'](image_tensor)
+            outputs = outputs[0][1]
 
         # Post-process
         prediction_results = self._post_process(outputs, input_shape, image_shape)
