@@ -268,7 +268,7 @@ def get_sliced_prediction(
     expand_ratio = 5.0
 
     # Handle custom ROIs if provided
-    if custom_rois:
+    if custom_rois and len(custom_rois) > 0:
         if verbose:
             tqdm.write(f"Performing prediction on {len(custom_rois)} custom ROIs.")
 
