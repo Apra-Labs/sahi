@@ -179,6 +179,7 @@ def get_sliced_prediction(
     exclude_classes_by_name: Optional[List[str]] = None,
     exclude_classes_by_id: Optional[List[int]] = None,
     custom_rois: Optional[List[List[int]]] = None,
+    expand_ratio: Optional[int] = 5.0,
 ) -> PredictionResult:
     """
     Function for slice image + get prediction for each slice + combine predictions in full image,
@@ -240,6 +241,9 @@ def get_sliced_prediction(
             If provided, slicing logic will be bypassed, and predictions will be made only
             within these regions. Shifts are applied to match the original image coordinates.
             Defaults to ``None``.
+        expand_ratio: Optional[int]
+            expands the custom region of interest rectangles `[[x_min, y_min, x_max, y_max], ...]` by given ratio.
+            Defaults to ``5.0``.
     Returns:
         A Dict with fields:
             object_prediction_list: a list of sahi.prediction.ObjectPrediction
@@ -264,8 +268,6 @@ def get_sliced_prediction(
         match_metric=postprocess_match_metric,
         class_agnostic=postprocess_class_agnostic,
     )
-
-    expand_ratio = 5.0
 
     # Handle custom ROIs if provided
     if custom_rois and len(custom_rois) > 0:
